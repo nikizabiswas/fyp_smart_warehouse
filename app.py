@@ -25,7 +25,7 @@ from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                               accuracy_score, precision_score, recall_score,
                               f1_score, confusion_matrix)
-from imblearn.over_sampling import SMOTE
+from sklearn.utils import resample
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LPG Demand Predictor", page_icon="🔵",
@@ -188,9 +188,23 @@ def preprocess(_df):
     Xtr_cs = pd.DataFrame(sc_c.fit_transform(Xtr_c), columns=clf_feat)
     Xte_cs = pd.DataFrame(sc_c.transform(Xte_c),     columns=clf_feat)
 
-    # SMOTE balancing for classification
-    sm = SMOTE(random_state=42, k_neighbors=5)
-    Xtr_sm, ytr_sm = sm.fit_resample(Xtr_cs, ytr_s.values)
+    # Oversample minority class to balance classification training data
+    # (replaces SMOTE from imblearn, which is incompatible with Python 3.14+)
+    Xtr_cs_arr = Xtr_cs.copy()
+    Xtr_cs_arr['__target__'] = ytr_s.values
+    majority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 0]
+    minority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 1]
+    if len(minority) < len(majority):
+        minority_upsampled = resample(minority, replace=True,
+                                      n_samples=len(majority), random_state=42)
+        balanced = pd.concat([majority, minority_upsampled])
+    else:
+        majority_upsampled = resample(majority, replace=True,
+                                      n_samples=len(minority), random_state=42)
+        balanced = pd.concat([majority_upsampled, minority])
+    balanced = balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+    ytr_sm = balanced['__target__'].values
+    Xtr_sm = balanced.drop(columns=['__target__']).values
 
     return (Xtr_rs, Xte_rs, Xtr_sm, ytr_sm, Xte_cs,
             ytr_d, yte_d, ytr_s, yte_s,
@@ -272,7 +286,7 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
     st.caption("Dataset: 5,000 records · 10 zones\nJan 2022 – Dec 2024\n(Train: 4,000 | Test: 1,000)")
-    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• SMOTE used for class balancing")
+    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• Oversampling used for class balancing")
     st.divider()
     st.markdown(
         f"<div style='font-size:.75rem;color:#5b7a99;'>🗓️ Today: "
@@ -297,7 +311,7 @@ if page == "📊 Overview & Data":
     <div class="hero">
       <div class="hero-title">🔵 Smart Warehouse Demand Prediction</div>
       <div class="hero-sub">LPG Cylinder Supply Chain · Mitra Bharatgas Agency · Murshidabad, West Bengal</div>
-      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · SMOTE Balanced</div>
+      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · Oversampling Balanced</div>
     </div>""", unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -950,7 +964,7 @@ elif page == "📋 Batch Report":
                            st.session_state["best_clf"],
                            f"{cdf.iloc[0]['F1 Score']:.4f}",
                            f"{cdf.iloc[0]['Accuracy']:.4f}",
-                           'SMOTE oversampling (k=5)',
+                           'Oversampling (sklearn resample)',
                            NOW.strftime('%d %B %Y %H:%M'),
                            f"{MONTH_FULL[min(month_sel)-1]} – {MONTH_FULL[max(month_sel)-1]} {year_sel}"]
             }).to_excel(w, sheet_name='Model_Summary', index=False)
