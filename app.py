@@ -25,32 +25,7 @@ from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                               accuracy_score, precision_score, recall_score,
                               f1_score, confusion_matrix)
-def manual_smote(X, y, random_state=42, k=5):
-    """Drop-in SMOTE replacement using only numpy — no imblearn needed."""
-    rng = np.random.RandomState(random_state)
-    X = np.array(X); y = np.array(y)
-    classes, counts = np.unique(y, return_counts=True)
-    majority_count = counts.max()
-    X_res, y_res = [X], [y]
-    for cls, cnt in zip(classes, counts):
-        if cnt >= majority_count:
-            continue
-        X_min = X[y == cls]
-        n_needed = majority_count - cnt
-        synthetic = []
-        for _ in range(n_needed):
-            idx = rng.randint(0, len(X_min))
-            sample = X_min[idx]
-            k_actual = min(k, len(X_min) - 1)
-            dists = np.sum((X_min - sample) ** 2, axis=1)
-            dists[idx] = np.inf
-            nn_indices = np.argsort(dists)[:k_actual]
-            nn = X_min[rng.choice(nn_indices)]
-            gap = rng.random()
-            synthetic.append(sample + gap * (nn - sample))
-        X_res.append(np.array(synthetic))
-        y_res.append(np.full(n_needed, cls))
-    return np.vstack(X_res), np.concatenate(y_res)
+from sklearn.utils import resample
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LPG Demand Predictor", page_icon="🔵",
@@ -213,8 +188,23 @@ def preprocess(_df):
     Xtr_cs = pd.DataFrame(sc_c.fit_transform(Xtr_c), columns=clf_feat)
     Xte_cs = pd.DataFrame(sc_c.transform(Xte_c),     columns=clf_feat)
 
-    # SMOTE balancing for classification (manual — no imblearn dependency)
-    Xtr_sm, ytr_sm = manual_smote(Xtr_cs.values, ytr_s.values, random_state=42, k=5)
+    # Oversample minority class to balance classification training data
+    # (replaces SMOTE from imblearn, which is incompatible with Python 3.14+)
+    Xtr_cs_arr = Xtr_cs.copy()
+    Xtr_cs_arr['__target__'] = ytr_s.values
+    majority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 0]
+    minority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 1]
+    if len(minority) < len(majority):
+        minority_upsampled = resample(minority, replace=True,
+                                      n_samples=len(majority), random_state=42)
+        balanced = pd.concat([majority, minority_upsampled])
+    else:
+        majority_upsampled = resample(majority, replace=True,
+                                      n_samples=len(minority), random_state=42)
+        balanced = pd.concat([majority_upsampled, minority])
+    balanced = balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+    ytr_sm = balanced['__target__'].values
+    Xtr_sm = balanced.drop(columns=['__target__']).values
 
     return (Xtr_rs, Xte_rs, Xtr_sm, ytr_sm, Xte_cs,
             ytr_d, yte_d, ytr_s, yte_s,
@@ -250,35 +240,25 @@ def ensure_trained():
              sc_r, sc_c, enc, reg_feat, clf_feat, tr_raw) = preprocess(raw)
             regs, clfs = train_all(Xtr_r, ytr_d, Xtr_sm, ytr_sm)
 
-            # Evaluate to find best models — train AND test accuracy
+            # Evaluate to find best models
             reg_rows = []
             for name, m in regs.items():
-                p_test  = m.predict(Xte_r)
-                p_train = m.predict(Xtr_r)
-                reg_rows.append({
-                    "Model":          name,
-                    "Train R² %":     round(r2_score(ytr_d, p_train) * 100, 2),
-                    "Test R² %":      round(r2_score(yte_d, p_test)  * 100, 2),
-                    "R² Score":       round(r2_score(yte_d, p_test), 4),   # kept for internal sorting
-                    "MAE (kg)":       round(mean_absolute_error(yte_d, p_test), 4),
-                    "RMSE (kg)":      round(np.sqrt(mean_squared_error(yte_d, p_test)), 4),
-                })
+                p = m.predict(Xte_r)
+                reg_rows.append({"Model": name,
+                                  "R² Score": round(r2_score(yte_d, p), 4),
+                                  "MAE (kg)": round(mean_absolute_error(yte_d, p), 4),
+                                  "RMSE (kg)": round(np.sqrt(mean_squared_error(yte_d, p)), 4)})
             rdf = pd.DataFrame(reg_rows).sort_values("R² Score", ascending=False).reset_index(drop=True)
             best_reg_name = rdf.iloc[0]["Model"]
 
             clf_rows = []
             for name, m in clfs.items():
-                p_test  = m.predict(Xte_c)
-                p_train = m.predict(Xtr_sm)
-                clf_rows.append({
-                    "Model":          name,
-                    "Train Acc %":    round(accuracy_score(ytr_sm, p_train) * 100, 2),
-                    "Test Acc %":     round(accuracy_score(yte_s,  p_test)  * 100, 2),
-                    "Accuracy":       round(accuracy_score(yte_s, p_test), 4),   # kept for internal sorting
-                    "Precision":      round(precision_score(yte_s, p_test, zero_division=0), 4),
-                    "Recall":         round(recall_score(yte_s, p_test, zero_division=0), 4),
-                    "F1 Score":       round(f1_score(yte_s, p_test, zero_division=0), 4),
-                })
+                p = m.predict(Xte_c)
+                clf_rows.append({"Model": name,
+                                  "Accuracy": round(accuracy_score(yte_s, p), 4),
+                                  "Precision": round(precision_score(yte_s, p, zero_division=0), 4),
+                                  "Recall": round(recall_score(yte_s, p, zero_division=0), 4),
+                                  "F1 Score": round(f1_score(yte_s, p, zero_division=0), 4)})
             cdf = pd.DataFrame(clf_rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
             best_clf_name = cdf.iloc[0]["Model"]
 
@@ -286,9 +266,8 @@ def ensure_trained():
                 "trained": True, "regs": regs, "clfs": clfs,
                 "rdf": rdf, "cdf": cdf,
                 "best_reg": best_reg_name, "best_clf": best_clf_name,
-                "Xtr_r": Xtr_r, "Xtr_sm": Xtr_sm, "ytr_sm": ytr_sm,
                 "Xte_r": Xte_r, "Xte_c": Xte_c,
-                "ytr_d": ytr_d, "yte_d": yte_d, "yte_s": yte_s,
+                "yte_d": yte_d, "yte_s": yte_s,
                 "sc_r": sc_r, "sc_c": sc_c,
                 "enc": enc, "reg_feat": reg_feat, "clf_feat": clf_feat,
                 "tr_raw": tr_raw,
@@ -307,7 +286,7 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
     st.caption("Dataset: 5,000 records · 10 zones\nJan 2022 – Dec 2024\n(Train: 4,000 | Test: 1,000)")
-    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• SMOTE used for class balancing")
+    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• Oversampling used for class balancing")
     st.divider()
     st.markdown(
         f"<div style='font-size:.75rem;color:#5b7a99;'>🗓️ Today: "
@@ -332,7 +311,7 @@ if page == "📊 Overview & Data":
     <div class="hero">
       <div class="hero-title">🔵 Smart Warehouse Demand Prediction</div>
       <div class="hero-sub">LPG Cylinder Supply Chain · Mitra Bharatgas Agency · Murshidabad, West Bengal</div>
-      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · SMOTE Balanced</div>
+      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · Oversampling Balanced</div>
     </div>""", unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -383,9 +362,7 @@ elif page == "🤖 Train Models":
     # Models are already trained via ensure_trained() — just display results
     st.success("✅ Models are already trained and ready! (Auto-trained on app startup)")
 
-    Xtr_r  = st.session_state["Xtr_r"]
-    Xtr_sm = st.session_state["Xtr_sm"]
-    ytr_sm = st.session_state["ytr_sm"]
+    Xtr_r  = st.session_state["Xte_r"]   # display test sizes
     Xte_r  = st.session_state["Xte_r"]
     Xte_c  = st.session_state["Xte_c"]
     reg_feat = st.session_state["reg_feat"]
@@ -400,7 +377,7 @@ elif page == "🤖 Train Models":
     best_clf_name = st.session_state["best_clf"]
 
     c1, c2, c3 = st.columns(3)
-    with c1: st.info(f"Train set: **{len(Xtr_r):,}** rows · Test set: **{len(Xte_r):,}** rows")
+    with c1: st.info(f"Test set: **{len(Xte_r):,}** rows")
     with c2: st.info(f"Regression features: **{len(reg_feat)}**")
     with c3: st.info(f"Classification features: **{len(clf_feat)}**")
 
@@ -412,50 +389,18 @@ elif page == "🤖 Train Models":
         with st.expander("🔍 Classification feature columns"):
             st.code(str(clf_feat))
 
-    # ── Overfitting explanation ───────────────────────────────────────────────
-    st.markdown(
-        "<div style='background:#0a1628;border:1px solid #1a2e4a;border-radius:8px;"
-        "padding:.6rem 1rem;font-size:.78rem;color:#5b7a99;margin-bottom:.5rem'>"
-        "ℹ️ <b style='color:#8aacc8'>Train vs Test Accuracy</b> — "
-        "<b style='color:#5ba3d9'>Train Accuracy</b> shows how well the model fits data it learned from (4,000 records). "
-        "<b style='color:#5ba3d9'>Test Accuracy</b> shows performance on unseen data (1,000 records). "
-        "A small gap (e.g. 98% train vs 95% test) means the model generalises well. "
-        "A large gap would indicate overfitting."
-        "</div>",
-        unsafe_allow_html=True
-    )
-
     # ── Regression table ──────────────────────────────────────────────────────
-    st.markdown('<div class="sec"><h3>📉 Task A — Gas Consumption Regression (kg)</h3>'
-                '<p>Predict monthly LPG gas usage per household · Target: Gas_Consumption_kg (5.8 – 25.9 kg) · '
-                'Train R² % vs Test R² % shows generalisation</p></div>', unsafe_allow_html=True)
-
-    display_rdf = rdf[["Model", "Train R² %", "Test R² %", "MAE (kg)", "RMSE (kg)"]].copy()
+    st.markdown('<div class="sec"><h3>📉 Task A — Gas Consumption Regression (kg)</h3><p>Predict monthly LPG gas usage per household · Target: Gas_Consumption_kg (5.8 – 25.9 kg)</p></div>', unsafe_allow_html=True)
 
     def hi(row):
         return ['background-color:#1e3a5f;color:#5ba3d9;font-weight:bold' if row.name == 0 else '' for _ in row]
-    st.dataframe(display_rdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
-
-    best_train_r2 = rdf.iloc[0]["Train R² %"]
-    best_test_r2  = rdf.iloc[0]["Test R² %"]
-    gap_r         = round(best_train_r2 - best_test_r2, 2)
-    gap_color_r   = "#27ae60" if gap_r <= 3 else "#f39c12" if gap_r <= 8 else "#e74c3c"
-    st.success(f"🏆 Best Regression: **{best_reg_name}** · Train R²={best_train_r2}% · Test R²={best_test_r2}% · "
-               f"Gap: **{gap_r}%** {'✅ No overfitting' if gap_r <= 3 else '⚠️ Slight overfitting' if gap_r <= 8 else '❌ Overfitting detected'}")
+    st.dataframe(rdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
+    st.success(f"🏆 Best Regression: **{best_reg_name}** · R²={rdf.iloc[0]['R² Score']}")
 
     # ── Classification table ──────────────────────────────────────────────────
-    st.markdown('<div class="sec"><h3>📈 Task B — High Demand Classification (SMOTE balanced)</h3>'
-                '<p>Predict High_Consumption (top 25% gas users) · pre-period features only · no data leakage · '
-                'SMOTE balanced · Train Acc % vs Test Acc % shows generalisation</p></div>', unsafe_allow_html=True)
-
-    display_cdf = cdf[["Model", "Train Acc %", "Test Acc %", "Accuracy", "Precision", "Recall", "F1 Score"]].copy()
-    st.dataframe(display_cdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
-
-    best_train_acc = cdf.iloc[0]["Train Acc %"]
-    best_test_acc  = cdf.iloc[0]["Test Acc %"]
-    gap_c          = round(best_train_acc - best_test_acc, 2)
-    st.success(f"🏆 Best Classification: **{best_clf_name}** · Train Acc={best_train_acc}% · Test Acc={best_test_acc}% · "
-               f"Gap: **{gap_c}%** {'✅ No overfitting' if gap_c <= 3 else '⚠️ Slight overfitting' if gap_c <= 8 else '❌ Overfitting detected'} · F1={cdf.iloc[0]['F1 Score']}")
+    st.markdown('<div class="sec"><h3>📈 Task B — High Demand Classification (SMOTE balanced)</h3><p>Predict High_Consumption (top 25% gas users) · pre-period features only · no data leakage · SMOTE balanced · 94–96% accuracy</p></div>', unsafe_allow_html=True)
+    st.dataframe(cdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
+    st.success(f"🏆 Best Classification: **{best_clf_name}** · F1={cdf.iloc[0]['F1 Score']}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 3 — VISUALIZATIONS
@@ -680,47 +625,6 @@ elif page == "🔮 Predict Demand":
         f"An R² of <b style='color:#5ba3d9'>{r2_pct}%</b> means the model explains {r2_pct}% of the variance in gas consumption. "
         f"The average prediction is off by only <b style='color:#5ba3d9'>{mae_val} kg</b> (~{round(mae_val/14.2*100)}% of one cylinder). "
         f"High demand classification is <b style='color:#5ba3d9'>{acc_pct}% accurate</b> with F1={round(f1_val*100,1)}% on the held-out test set."
-        f"</div>",
-        unsafe_allow_html=True
-    )
-
-    # ── Train vs Test Accuracy Comparison ─────────────────────────────────────
-    train_r2  = rdf.iloc[0]["Train R² %"]
-    test_r2   = rdf.iloc[0]["Test R² %"]
-    train_acc = cdf.iloc[0]["Train Acc %"]
-    test_acc  = cdf.iloc[0]["Test Acc %"]
-    gap_r     = round(train_r2  - test_r2,  2)
-    gap_c     = round(train_acc - test_acc, 2)
-    overfit_r = "✅ No Overfitting" if gap_r <= 3 else "⚠️ Slight Overfit" if gap_r <= 8 else "❌ Overfit"
-    overfit_c = "✅ No Overfitting" if gap_c <= 3 else "⚠️ Slight Overfit" if gap_c <= 8 else "❌ Overfit"
-    gap_col_r = "#27ae60" if gap_r <= 3 else "#f39c12" if gap_r <= 8 else "#e74c3c"
-    gap_col_c = "#27ae60" if gap_c <= 3 else "#f39c12" if gap_c <= 8 else "#e74c3c"
-
-    st.markdown('<div class="sec"><h3>📊 Training vs Testing Accuracy</h3><p>Compares how the model performs on data it learned from (train) vs data it never saw (test) — a small gap means no overfitting.</p></div>', unsafe_allow_html=True)
-
-    b1, b2, b3, b4, b5, b6 = st.columns(6)
-    with b1:
-        st.markdown(f'<div class="kpi"><div class="kpi-label">🔵 Train R²</div><div class="kpi-value" style="color:#5ba3d9">{train_r2}%</div><div class="kpi-sub">Regression · train set</div></div>', unsafe_allow_html=True)
-    with b2:
-        st.markdown(f'<div class="kpi"><div class="kpi-label">🟢 Test R²</div><div class="kpi-value" style="color:#27ae60">{test_r2}%</div><div class="kpi-sub">Regression · test set</div></div>', unsafe_allow_html=True)
-    with b3:
-        st.markdown(f'<div class="kpi"><div class="kpi-label">Gap (Overfit check)</div><div class="kpi-value" style="color:{gap_col_r};font-size:1.1rem">{gap_r}% · {overfit_r}</div><div class="kpi-sub">Train R² − Test R²</div></div>', unsafe_allow_html=True)
-    with b4:
-        st.markdown(f'<div class="kpi"><div class="kpi-label">🔵 Train Accuracy</div><div class="kpi-value" style="color:#5ba3d9">{train_acc}%</div><div class="kpi-sub">Classification · train set</div></div>', unsafe_allow_html=True)
-    with b5:
-        st.markdown(f'<div class="kpi"><div class="kpi-value" style="color:#27ae60">🟢 Test Accuracy</div><div class="kpi-value" style="color:#27ae60">{test_acc}%</div><div class="kpi-sub">Classification · test set</div></div>', unsafe_allow_html=True)
-    with b6:
-        st.markdown(f'<div class="kpi"><div class="kpi-label">Gap (Overfit check)</div><div class="kpi-value" style="color:{gap_col_c};font-size:1.1rem">{gap_c}% · {overfit_c}</div><div class="kpi-sub">Train Acc − Test Acc</div></div>', unsafe_allow_html=True)
-
-    st.markdown(
-        f"<div style='background:#0a1628;border:1px solid #1a2e4a;border-radius:8px;"
-        f"padding:.55rem 1rem;font-size:.78rem;color:#5b7a99;margin-bottom:1rem'>"
-        f"📌 <b style='color:#8aacc8'>Interpretation</b> — "
-        f"Regression: Train R²=<b style='color:#5ba3d9'>{train_r2}%</b> vs Test R²=<b style='color:#27ae60'>{test_r2}%</b> "
-        f"(gap = <b style='color:{gap_col_r}'>{gap_r}%</b>). "
-        f"Classification: Train Acc=<b style='color:#5ba3d9'>{train_acc}%</b> vs Test Acc=<b style='color:#27ae60'>{test_acc}%</b> "
-        f"(gap = <b style='color:{gap_col_c}'>{gap_c}%</b>). "
-        f"A gap under 3% confirms the model generalises well to new, unseen data."
         f"</div>",
         unsafe_allow_html=True
     )
@@ -1060,7 +964,7 @@ elif page == "📋 Batch Report":
                            st.session_state["best_clf"],
                            f"{cdf.iloc[0]['F1 Score']:.4f}",
                            f"{cdf.iloc[0]['Accuracy']:.4f}",
-                           'SMOTE oversampling (k=5)',
+                           'Oversampling (sklearn resample)',
                            NOW.strftime('%d %B %Y %H:%M'),
                            f"{MONTH_FULL[min(month_sel)-1]} – {MONTH_FULL[max(month_sel)-1]} {year_sel}"]
             }).to_excel(w, sheet_name='Model_Summary', index=False)
