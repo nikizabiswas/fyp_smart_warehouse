@@ -25,7 +25,32 @@ from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                               accuracy_score, precision_score, recall_score,
                               f1_score, confusion_matrix)
-from imblearn.over_sampling import SMOTE
+def manual_smote(X, y, random_state=42, k=5):
+    """Drop-in SMOTE replacement using only numpy — no imblearn needed."""
+    rng = np.random.RandomState(random_state)
+    X = np.array(X); y = np.array(y)
+    classes, counts = np.unique(y, return_counts=True)
+    majority_count = counts.max()
+    X_res, y_res = [X], [y]
+    for cls, cnt in zip(classes, counts):
+        if cnt >= majority_count:
+            continue
+        X_min = X[y == cls]
+        n_needed = majority_count - cnt
+        synthetic = []
+        for _ in range(n_needed):
+            idx = rng.randint(0, len(X_min))
+            sample = X_min[idx]
+            k_actual = min(k, len(X_min) - 1)
+            dists = np.sum((X_min - sample) ** 2, axis=1)
+            dists[idx] = np.inf
+            nn_indices = np.argsort(dists)[:k_actual]
+            nn = X_min[rng.choice(nn_indices)]
+            gap = rng.random()
+            synthetic.append(sample + gap * (nn - sample))
+        X_res.append(np.array(synthetic))
+        y_res.append(np.full(n_needed, cls))
+    return np.vstack(X_res), np.concatenate(y_res)
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LPG Demand Predictor", page_icon="🔵",
@@ -192,9 +217,8 @@ def preprocess(_df):
     Xtr_cs = pd.DataFrame(sc_c.fit_transform(Xtr_c), columns=clf_feat)
     Xte_cs = pd.DataFrame(sc_c.transform(Xte_c),     columns=clf_feat)
 
-    # SMOTE balancing for classification
-    sm = SMOTE(random_state=42, k_neighbors=5)
-    Xtr_sm, ytr_sm = sm.fit_resample(Xtr_cs, ytr_s.values)
+    # SMOTE balancing for classification (manual — no imblearn dependency)
+    Xtr_sm, ytr_sm = manual_smote(Xtr_cs.values, ytr_s.values, random_state=42, k=5)
 
     return (Xtr_rs, Xte_rs, Xtr_sm, ytr_sm, Xte_cs,
             ytr_d, yte_d, ytr_s, yte_s,
