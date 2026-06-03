@@ -25,7 +25,7 @@ from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                               accuracy_score, precision_score, recall_score,
                               f1_score, confusion_matrix)
-from sklearn.utils import resample
+from imblearn.over_sampling import SMOTE
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LPG Demand Predictor", page_icon="🔵",
@@ -171,6 +171,10 @@ def preprocess(_df):
         df['Adult_ratio']         = df['No_of_Adults'] / (df['No_of_Family_Members'] + 1)
         df['Seasonal_multiplier'] = 1 + df['Is_Winter']*0.4 + df['Is_Festival_Month']*0.3
         df['Affordability']       = df['Monthly_Income (₹)'] / (df['LPG_Price_per_Cylinder (₹)'] + 1)
+        df['Winter_x_Adults']     = df['Is_Winter'] * df['No_of_Adults']
+        df['Festival_x_Members']  = df['Is_Festival_Month'] * df['No_of_Family_Members']
+        df['Income_x_Winter']     = df['Monthly_Income (₹)'] * df['Is_Winter'] / 10000
+        df['Stock_per_order']     = df['Zone_Opening_Stock'] / (df['Zone_Cylinders_Ordered'] + 1)
 
     reg_feat = [c for c in tr.columns if c not in REG_EXCLUDE]
     clf_feat = [c for c in tr.columns if c not in CLF_EXCLUDE]
@@ -188,23 +192,9 @@ def preprocess(_df):
     Xtr_cs = pd.DataFrame(sc_c.fit_transform(Xtr_c), columns=clf_feat)
     Xte_cs = pd.DataFrame(sc_c.transform(Xte_c),     columns=clf_feat)
 
-    # Oversample minority class to balance classification training data
-    # (replaces SMOTE from imblearn, which is incompatible with Python 3.14+)
-    Xtr_cs_arr = Xtr_cs.copy()
-    Xtr_cs_arr['__target__'] = ytr_s.values
-    majority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 0]
-    minority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 1]
-    if len(minority) < len(majority):
-        minority_upsampled = resample(minority, replace=True,
-                                      n_samples=len(majority), random_state=42)
-        balanced = pd.concat([majority, minority_upsampled])
-    else:
-        majority_upsampled = resample(majority, replace=True,
-                                      n_samples=len(minority), random_state=42)
-        balanced = pd.concat([majority_upsampled, minority])
-    balanced = balanced.sample(frac=1, random_state=42).reset_index(drop=True)
-    ytr_sm = balanced['__target__'].values
-    Xtr_sm = balanced.drop(columns=['__target__']).values
+    # SMOTE balancing for classification
+    sm = SMOTE(random_state=42, k_neighbors=5)
+    Xtr_sm, ytr_sm = sm.fit_resample(Xtr_cs, ytr_s.values)
 
     return (Xtr_rs, Xte_rs, Xtr_sm, ytr_sm, Xte_cs,
             ytr_d, yte_d, ytr_s, yte_s,
@@ -219,10 +209,12 @@ def train_all(_Xtr_r, _ytr_d, _Xtr_sm, _ytr_sm):
         'Gradient Boosting': GradientBoostingRegressor(n_estimators=150, max_depth=5, learning_rate=0.1, random_state=42),
     }
     clfs = {
-        'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
-        'Decision Tree':       DecisionTreeClassifier(max_depth=8, random_state=42),
-        'Random Forest':       RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42, n_jobs=-1),
-        'Gradient Boosting':   GradientBoostingClassifier(n_estimators=150, max_depth=5, learning_rate=0.1, random_state=42),
+        'Logistic Regression': LogisticRegression(max_iter=2000, C=0.5, random_state=42),
+        'Decision Tree':       DecisionTreeClassifier(max_depth=6, min_samples_leaf=10, random_state=42),
+        'Random Forest':       RandomForestClassifier(n_estimators=300, max_depth=10, min_samples_leaf=5,
+                                                      max_features='sqrt', random_state=42, n_jobs=-1),
+        'Gradient Boosting':   GradientBoostingClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                                          subsample=0.8, min_samples_leaf=10, random_state=42),
     }
     for m in regs.values(): m.fit(_Xtr_r,  _ytr_d)
     for m in clfs.values(): m.fit(_Xtr_sm, _ytr_sm)
@@ -256,9 +248,9 @@ def ensure_trained():
                 p = m.predict(Xte_c)
                 clf_rows.append({"Model": name,
                                   "Accuracy": round(accuracy_score(yte_s, p), 4),
-                                  "Precision": round(precision_score(yte_s, p, zero_division=0), 4),
-                                  "Recall": round(recall_score(yte_s, p, zero_division=0), 4),
-                                  "F1 Score": round(f1_score(yte_s, p, zero_division=0), 4)})
+                                  "Precision": round(precision_score(yte_s, p, average='weighted', zero_division=0), 4),
+                                  "Recall": round(recall_score(yte_s, p, average='weighted', zero_division=0), 4),
+                                  "F1 Score": round(f1_score(yte_s, p, average='weighted', zero_division=0), 4)})
             cdf = pd.DataFrame(clf_rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
             best_clf_name = cdf.iloc[0]["Model"]
 
@@ -286,7 +278,7 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
     st.caption("Dataset: 5,000 records · 10 zones\nJan 2022 – Dec 2024\n(Train: 4,000 | Test: 1,000)")
-    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• Oversampling used for class balancing")
+    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• SMOTE used for class balancing")
     st.divider()
     st.markdown(
         f"<div style='font-size:.75rem;color:#5b7a99;'>🗓️ Today: "
@@ -311,7 +303,7 @@ if page == "📊 Overview & Data":
     <div class="hero">
       <div class="hero-title">🔵 Smart Warehouse Demand Prediction</div>
       <div class="hero-sub">LPG Cylinder Supply Chain · Mitra Bharatgas Agency · Murshidabad, West Bengal</div>
-      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · Oversampling Balanced</div>
+      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · SMOTE Balanced</div>
     </div>""", unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -964,7 +956,7 @@ elif page == "📋 Batch Report":
                            st.session_state["best_clf"],
                            f"{cdf.iloc[0]['F1 Score']:.4f}",
                            f"{cdf.iloc[0]['Accuracy']:.4f}",
-                           'Oversampling (sklearn resample)',
+                           'SMOTE oversampling (k=5)',
                            NOW.strftime('%d %B %Y %H:%M'),
                            f"{MONTH_FULL[min(month_sel)-1]} – {MONTH_FULL[max(month_sel)-1]} {year_sel}"]
             }).to_excel(w, sheet_name='Model_Summary', index=False)
