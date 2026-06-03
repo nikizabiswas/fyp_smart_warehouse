@@ -25,7 +25,7 @@ from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                               accuracy_score, precision_score, recall_score,
                               f1_score, confusion_matrix)
-from sklearn.utils import resample
+from imblearn.over_sampling import SMOTE
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LPG Demand Predictor", page_icon="🔵",
@@ -188,23 +188,9 @@ def preprocess(_df):
     Xtr_cs = pd.DataFrame(sc_c.fit_transform(Xtr_c), columns=clf_feat)
     Xte_cs = pd.DataFrame(sc_c.transform(Xte_c),     columns=clf_feat)
 
-    # Oversample minority class to balance classification training data
-    # (replaces SMOTE from imblearn, which is incompatible with Python 3.14+)
-    Xtr_cs_arr = Xtr_cs.copy()
-    Xtr_cs_arr['__target__'] = ytr_s.values
-    majority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 0]
-    minority = Xtr_cs_arr[Xtr_cs_arr['__target__'] == 1]
-    if len(minority) < len(majority):
-        minority_upsampled = resample(minority, replace=True,
-                                      n_samples=len(majority), random_state=42)
-        balanced = pd.concat([majority, minority_upsampled])
-    else:
-        majority_upsampled = resample(majority, replace=True,
-                                      n_samples=len(minority), random_state=42)
-        balanced = pd.concat([majority_upsampled, minority])
-    balanced = balanced.sample(frac=1, random_state=42).reset_index(drop=True)
-    ytr_sm = balanced['__target__'].values
-    Xtr_sm = balanced.drop(columns=['__target__']).values
+    # SMOTE balancing for classification
+    sm = SMOTE(random_state=42, k_neighbors=5)
+    Xtr_sm, ytr_sm = sm.fit_resample(Xtr_cs, ytr_s.values)
 
     return (Xtr_rs, Xte_rs, Xtr_sm, ytr_sm, Xte_cs,
             ytr_d, yte_d, ytr_s, yte_s,
@@ -240,25 +226,35 @@ def ensure_trained():
              sc_r, sc_c, enc, reg_feat, clf_feat, tr_raw) = preprocess(raw)
             regs, clfs = train_all(Xtr_r, ytr_d, Xtr_sm, ytr_sm)
 
-            # Evaluate to find best models
+            # Evaluate to find best models — train AND test accuracy
             reg_rows = []
             for name, m in regs.items():
-                p = m.predict(Xte_r)
-                reg_rows.append({"Model": name,
-                                  "R² Score": round(r2_score(yte_d, p), 4),
-                                  "MAE (kg)": round(mean_absolute_error(yte_d, p), 4),
-                                  "RMSE (kg)": round(np.sqrt(mean_squared_error(yte_d, p)), 4)})
+                p_test  = m.predict(Xte_r)
+                p_train = m.predict(Xtr_r)
+                reg_rows.append({
+                    "Model":          name,
+                    "Train R² %":     round(r2_score(ytr_d, p_train) * 100, 2),
+                    "Test R² %":      round(r2_score(yte_d, p_test)  * 100, 2),
+                    "R² Score":       round(r2_score(yte_d, p_test), 4),   # kept for internal sorting
+                    "MAE (kg)":       round(mean_absolute_error(yte_d, p_test), 4),
+                    "RMSE (kg)":      round(np.sqrt(mean_squared_error(yte_d, p_test)), 4),
+                })
             rdf = pd.DataFrame(reg_rows).sort_values("R² Score", ascending=False).reset_index(drop=True)
             best_reg_name = rdf.iloc[0]["Model"]
 
             clf_rows = []
             for name, m in clfs.items():
-                p = m.predict(Xte_c)
-                clf_rows.append({"Model": name,
-                                  "Accuracy": round(accuracy_score(yte_s, p), 4),
-                                  "Precision": round(precision_score(yte_s, p, zero_division=0), 4),
-                                  "Recall": round(recall_score(yte_s, p, zero_division=0), 4),
-                                  "F1 Score": round(f1_score(yte_s, p, zero_division=0), 4)})
+                p_test  = m.predict(Xte_c)
+                p_train = m.predict(Xtr_sm)
+                clf_rows.append({
+                    "Model":          name,
+                    "Train Acc %":    round(accuracy_score(ytr_sm, p_train) * 100, 2),
+                    "Test Acc %":     round(accuracy_score(yte_s,  p_test)  * 100, 2),
+                    "Accuracy":       round(accuracy_score(yte_s, p_test), 4),   # kept for internal sorting
+                    "Precision":      round(precision_score(yte_s, p_test, zero_division=0), 4),
+                    "Recall":         round(recall_score(yte_s, p_test, zero_division=0), 4),
+                    "F1 Score":       round(f1_score(yte_s, p_test, zero_division=0), 4),
+                })
             cdf = pd.DataFrame(clf_rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
             best_clf_name = cdf.iloc[0]["Model"]
 
@@ -266,8 +262,9 @@ def ensure_trained():
                 "trained": True, "regs": regs, "clfs": clfs,
                 "rdf": rdf, "cdf": cdf,
                 "best_reg": best_reg_name, "best_clf": best_clf_name,
+                "Xtr_r": Xtr_r, "Xtr_sm": Xtr_sm, "ytr_sm": ytr_sm,
                 "Xte_r": Xte_r, "Xte_c": Xte_c,
-                "yte_d": yte_d, "yte_s": yte_s,
+                "ytr_d": ytr_d, "yte_d": yte_d, "yte_s": yte_s,
                 "sc_r": sc_r, "sc_c": sc_c,
                 "enc": enc, "reg_feat": reg_feat, "clf_feat": clf_feat,
                 "tr_raw": tr_raw,
@@ -286,7 +283,7 @@ with st.sidebar:
     ], label_visibility="collapsed")
     st.divider()
     st.caption("Dataset: 5,000 records · 10 zones\nJan 2022 – Dec 2024\n(Train: 4,000 | Test: 1,000)")
-    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• Oversampling used for class balancing")
+    st.caption("Targets:\n• Gas Consumption (kg) — Regression\n• High Demand Consumer — Classification\n• SMOTE used for class balancing")
     st.divider()
     st.markdown(
         f"<div style='font-size:.75rem;color:#5b7a99;'>🗓️ Today: "
@@ -311,7 +308,7 @@ if page == "📊 Overview & Data":
     <div class="hero">
       <div class="hero-title">🔵 Smart Warehouse Demand Prediction</div>
       <div class="hero-sub">LPG Cylinder Supply Chain · Mitra Bharatgas Agency · Murshidabad, West Bengal</div>
-      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · Oversampling Balanced</div>
+      <div class="hero-badge">Gradient Boosting Regression · R²=0.9451 · Logistic Regression · F1=1.00 · SMOTE Balanced</div>
     </div>""", unsafe_allow_html=True)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -362,7 +359,9 @@ elif page == "🤖 Train Models":
     # Models are already trained via ensure_trained() — just display results
     st.success("✅ Models are already trained and ready! (Auto-trained on app startup)")
 
-    Xtr_r  = st.session_state["Xte_r"]   # display test sizes
+    Xtr_r  = st.session_state["Xtr_r"]
+    Xtr_sm = st.session_state["Xtr_sm"]
+    ytr_sm = st.session_state["ytr_sm"]
     Xte_r  = st.session_state["Xte_r"]
     Xte_c  = st.session_state["Xte_c"]
     reg_feat = st.session_state["reg_feat"]
@@ -377,7 +376,7 @@ elif page == "🤖 Train Models":
     best_clf_name = st.session_state["best_clf"]
 
     c1, c2, c3 = st.columns(3)
-    with c1: st.info(f"Test set: **{len(Xte_r):,}** rows")
+    with c1: st.info(f"Train set: **{len(Xtr_r):,}** rows · Test set: **{len(Xte_r):,}** rows")
     with c2: st.info(f"Regression features: **{len(reg_feat)}**")
     with c3: st.info(f"Classification features: **{len(clf_feat)}**")
 
@@ -389,18 +388,50 @@ elif page == "🤖 Train Models":
         with st.expander("🔍 Classification feature columns"):
             st.code(str(clf_feat))
 
+    # ── Overfitting explanation ───────────────────────────────────────────────
+    st.markdown(
+        "<div style='background:#0a1628;border:1px solid #1a2e4a;border-radius:8px;"
+        "padding:.6rem 1rem;font-size:.78rem;color:#5b7a99;margin-bottom:.5rem'>"
+        "ℹ️ <b style='color:#8aacc8'>Train vs Test Accuracy</b> — "
+        "<b style='color:#5ba3d9'>Train Accuracy</b> shows how well the model fits data it learned from (4,000 records). "
+        "<b style='color:#5ba3d9'>Test Accuracy</b> shows performance on unseen data (1,000 records). "
+        "A small gap (e.g. 98% train vs 95% test) means the model generalises well. "
+        "A large gap would indicate overfitting."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
     # ── Regression table ──────────────────────────────────────────────────────
-    st.markdown('<div class="sec"><h3>📉 Task A — Gas Consumption Regression (kg)</h3><p>Predict monthly LPG gas usage per household · Target: Gas_Consumption_kg (5.8 – 25.9 kg)</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec"><h3>📉 Task A — Gas Consumption Regression (kg)</h3>'
+                '<p>Predict monthly LPG gas usage per household · Target: Gas_Consumption_kg (5.8 – 25.9 kg) · '
+                'Train R² % vs Test R² % shows generalisation</p></div>', unsafe_allow_html=True)
+
+    display_rdf = rdf[["Model", "Train R² %", "Test R² %", "MAE (kg)", "RMSE (kg)"]].copy()
 
     def hi(row):
         return ['background-color:#1e3a5f;color:#5ba3d9;font-weight:bold' if row.name == 0 else '' for _ in row]
-    st.dataframe(rdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
-    st.success(f"🏆 Best Regression: **{best_reg_name}** · R²={rdf.iloc[0]['R² Score']}")
+    st.dataframe(display_rdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
+
+    best_train_r2 = rdf.iloc[0]["Train R² %"]
+    best_test_r2  = rdf.iloc[0]["Test R² %"]
+    gap_r         = round(best_train_r2 - best_test_r2, 2)
+    gap_color_r   = "#27ae60" if gap_r <= 3 else "#f39c12" if gap_r <= 8 else "#e74c3c"
+    st.success(f"🏆 Best Regression: **{best_reg_name}** · Train R²={best_train_r2}% · Test R²={best_test_r2}% · "
+               f"Gap: **{gap_r}%** {'✅ No overfitting' if gap_r <= 3 else '⚠️ Slight overfitting' if gap_r <= 8 else '❌ Overfitting detected'}")
 
     # ── Classification table ──────────────────────────────────────────────────
-    st.markdown('<div class="sec"><h3>📈 Task B — High Demand Classification (SMOTE balanced)</h3><p>Predict High_Consumption (top 25% gas users) · pre-period features only · no data leakage · SMOTE balanced · 94–96% accuracy</p></div>', unsafe_allow_html=True)
-    st.dataframe(cdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
-    st.success(f"🏆 Best Classification: **{best_clf_name}** · F1={cdf.iloc[0]['F1 Score']}")
+    st.markdown('<div class="sec"><h3>📈 Task B — High Demand Classification (SMOTE balanced)</h3>'
+                '<p>Predict High_Consumption (top 25% gas users) · pre-period features only · no data leakage · '
+                'SMOTE balanced · Train Acc % vs Test Acc % shows generalisation</p></div>', unsafe_allow_html=True)
+
+    display_cdf = cdf[["Model", "Train Acc %", "Test Acc %", "Accuracy", "Precision", "Recall", "F1 Score"]].copy()
+    st.dataframe(display_cdf.style.apply(hi, axis=1), width='stretch', hide_index=True)
+
+    best_train_acc = cdf.iloc[0]["Train Acc %"]
+    best_test_acc  = cdf.iloc[0]["Test Acc %"]
+    gap_c          = round(best_train_acc - best_test_acc, 2)
+    st.success(f"🏆 Best Classification: **{best_clf_name}** · Train Acc={best_train_acc}% · Test Acc={best_test_acc}% · "
+               f"Gap: **{gap_c}%** {'✅ No overfitting' if gap_c <= 3 else '⚠️ Slight overfitting' if gap_c <= 8 else '❌ Overfitting detected'} · F1={cdf.iloc[0]['F1 Score']}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 3 — VISUALIZATIONS
@@ -964,7 +995,7 @@ elif page == "📋 Batch Report":
                            st.session_state["best_clf"],
                            f"{cdf.iloc[0]['F1 Score']:.4f}",
                            f"{cdf.iloc[0]['Accuracy']:.4f}",
-                           'Oversampling (sklearn resample)',
+                           'SMOTE oversampling (k=5)',
                            NOW.strftime('%d %B %Y %H:%M'),
                            f"{MONTH_FULL[min(month_sel)-1]} – {MONTH_FULL[max(month_sel)-1]} {year_sel}"]
             }).to_excel(w, sheet_name='Model_Summary', index=False)
